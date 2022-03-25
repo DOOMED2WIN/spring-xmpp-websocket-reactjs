@@ -1,11 +1,9 @@
 package com.sergiomartinrubio.springxmppwebsocketsecurity.xmpp;
 
-import com.sergiomartinrubio.springxmppwebsocketsecurity.exception.XMPPGenericException;
-import com.sergiomartinrubio.springxmppwebsocketsecurity.model.Account;
-import com.sergiomartinrubio.springxmppwebsocketsecurity.service.AccountService;
-import com.sergiomartinrubio.springxmppwebsocketsecurity.utils.BCryptUtils;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import java.io.IOException;
+import java.util.Optional;
+import java.util.Set;
+import javax.websocket.Session;
 import org.jivesoftware.smack.ConnectionConfiguration;
 import org.jivesoftware.smack.SmackException;
 import org.jivesoftware.smack.XMPPException;
@@ -24,13 +22,18 @@ import org.jxmpp.jid.EntityFullJid;
 import org.jxmpp.jid.impl.JidCreate;
 import org.jxmpp.jid.parts.Localpart;
 import org.jxmpp.stringprep.XmppStringprepException;
+import org.reactivestreams.Publisher;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.stereotype.Component;
-
-import javax.websocket.Session;
-import java.io.IOException;
-import java.util.Optional;
-import java.util.Set;
+import com.sergiomartinrubio.springxmppwebsocketsecurity.exception.XMPPGenericException;
+import com.sergiomartinrubio.springxmppwebsocketsecurity.model.Account;
+import com.sergiomartinrubio.springxmppwebsocketsecurity.service.AccountService;
+import com.sergiomartinrubio.springxmppwebsocketsecurity.utils.BCryptUtils;
+import io.leangen.graphql.spqr.spring.util.ConcurrentMultiMap;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
 
 @Slf4j
 @Component
@@ -41,6 +44,7 @@ public class XMPPClient {
     private final XMPPProperties xmppProperties;
     private final AccountService accountService;
     private final XMPPMessageTransmitter xmppMessageTransmitter;
+    private final ConcurrentMultiMap<String, FluxSink<MessageDto>> subscribers = new ConcurrentMultiMap<>();
 
     public Optional<XMPPTCPConnection> connect(String username, String plainTextPassword) {
         XMPPTCPConnection connection;
@@ -93,12 +97,18 @@ public class XMPPClient {
         }
         log.info("User '{}' logged in.", connection.getUser());
     }
-
+    
     public void addIncomingMessageListener(XMPPTCPConnection connection, Session webSocketSession) {
-        ChatManager chatManager = ChatManager.getInstanceFor(connection);
-        chatManager.addIncomingListener((from, message, chat) -> xmppMessageTransmitter
-                .sendResponse(message, webSocketSession));
-        log.info("Incoming message listener for user '{}' added.", connection.getUser());
+      ChatManager chatManager = ChatManager.getInstanceFor(connection);
+      chatManager.addIncomingListener((from, message, chat) -> xmppMessageTransmitter
+              .sendResponse(message, webSocketSession));
+      log.info("Incoming message listener for user '{}' added.", connection.getUser());
+    }
+
+    public Publisher<MessageDto> addIncomingMessageListener(XMPPTCPConnection connection) {
+      return Flux.create(subscriber -> subscribers.add(
+            connection.getUser().getLocalpart().toString(), 
+            subscriber.onDispose(() -> subscribers.remove(connection.getUser().getLocalpart().toString(), subscriber))), FluxSink.OverflowStrategy.LATEST);
     }
 
     public void sendMessage(XMPPTCPConnection connection, String message, String to) {
@@ -106,6 +116,11 @@ public class XMPPClient {
         try {
             Chat chat = chatManager.chatWith(JidCreate.entityBareFrom(to + "@" + xmppProperties.getDomain()));
             chat.send(message);
+            subscribers.get(connection.getUser().getLocalpart().toString()).forEach(
+                subscriber -> subscriber.next(new MessageDto(to, message)));
+            
+            subscribers.get(to).forEach(
+                subscriber -> subscriber.next(new MessageDto(connection.getUser().getLocalpart().toString(), message)));
             log.info("Message sent to user '{}' from user '{}'.", to, connection.getUser());
         } catch (XmppStringprepException | SmackException.NotConnectedException | InterruptedException e) {
             throw new XMPPGenericException(connection.getUser().toString(), e);

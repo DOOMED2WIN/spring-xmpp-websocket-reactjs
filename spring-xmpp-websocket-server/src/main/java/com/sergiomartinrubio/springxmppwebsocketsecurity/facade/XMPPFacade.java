@@ -1,42 +1,74 @@
 package com.sergiomartinrubio.springxmppwebsocketsecurity.facade;
 
+import static com.sergiomartinrubio.springxmppwebsocketsecurity.model.MessageType.ERROR;
+import static com.sergiomartinrubio.springxmppwebsocketsecurity.model.MessageType.FORBIDDEN;
+import static com.sergiomartinrubio.springxmppwebsocketsecurity.model.MessageType.GET_CONTACTS;
+import static com.sergiomartinrubio.springxmppwebsocketsecurity.model.MessageType.JOIN_SUCCESS;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import javax.websocket.Session;
+import org.jivesoftware.smack.packet.Presence;
+import org.jivesoftware.smack.roster.RosterEntry;
+import org.jivesoftware.smack.tcp.XMPPTCPConnection;
+import org.reactivestreams.Publisher;
+import org.springframework.boot.configurationprocessor.json.JSONArray;
+import org.springframework.stereotype.Component;
 import com.sergiomartinrubio.springxmppwebsocketsecurity.exception.XMPPGenericException;
 import com.sergiomartinrubio.springxmppwebsocketsecurity.model.Account;
 import com.sergiomartinrubio.springxmppwebsocketsecurity.model.WebsocketMessage;
 import com.sergiomartinrubio.springxmppwebsocketsecurity.service.AccountService;
 import com.sergiomartinrubio.springxmppwebsocketsecurity.utils.BCryptUtils;
 import com.sergiomartinrubio.springxmppwebsocketsecurity.websocket.utils.WebSocketTextMessageHelper;
+import com.sergiomartinrubio.springxmppwebsocketsecurity.xmpp.MessageDto;
 import com.sergiomartinrubio.springxmppwebsocketsecurity.xmpp.XMPPClient;
+import io.leangen.graphql.annotations.GraphQLMutation;
+import io.leangen.graphql.annotations.GraphQLQuery;
+import io.leangen.graphql.annotations.GraphQLSubscription;
+import io.leangen.graphql.spqr.spring.annotations.GraphQLApi;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.jivesoftware.smack.packet.Presence;
-import org.jivesoftware.smack.roster.RosterEntry;
-import org.jivesoftware.smack.tcp.XMPPTCPConnection;
-import org.springframework.boot.configurationprocessor.json.JSONArray;
-import org.springframework.stereotype.Component;
-
-import javax.websocket.Session;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-
-import static com.sergiomartinrubio.springxmppwebsocketsecurity.model.MessageType.ERROR;
-import static com.sergiomartinrubio.springxmppwebsocketsecurity.model.MessageType.FORBIDDEN;
-import static com.sergiomartinrubio.springxmppwebsocketsecurity.model.MessageType.GET_CONTACTS;
-import static com.sergiomartinrubio.springxmppwebsocketsecurity.model.MessageType.JOIN_SUCCESS;
 
 @Slf4j
 @Component
+@GraphQLApi
 @RequiredArgsConstructor
 public class XMPPFacade {
 
     private static final Map<Session, XMPPTCPConnection> CONNECTIONS = new HashMap<>();
+    
+    private static final Map<String, XMPPTCPConnection> CONNECTIONS2 = new HashMap<>();
 
     private final AccountService accountService;
     private final WebSocketTextMessageHelper webSocketTextMessageHelper;
     private final XMPPClient xmppClient;
+    
+    @GraphQLQuery
+    public String test() {
+      return "hello";
+    }
 
+    @GraphQLSubscription
+    public Publisher<MessageDto> taskStatusChanged(String username, String password) {
+      Optional<Account> account = accountService.getAccount(username);
+
+      Optional<XMPPTCPConnection> connection = xmppClient.connect(username, password);
+
+      try {
+          if (account.isEmpty()) {
+              xmppClient.createAccount(connection.get(), username, password);
+          }
+          xmppClient.login(connection.get());
+      } catch (XMPPGenericException e) {
+      }
+      
+      log.info("Session was stored.");
+      CONNECTIONS2.put(username, connection.get());
+      return xmppClient.addIncomingMessageListener(connection.get());
+    }
+    
+    
     public void startSession(Session session, String username, String password) {
         // TODO: Save user session to avoid having to login again when the websocket connection is closed
         //      1. Generate token
@@ -47,6 +79,7 @@ public class XMPPFacade {
 
         if (account.isPresent() && !BCryptUtils.isMatch(password, account.get().getPassword())) {
             log.warn("Invalid password for user {}.", username);
+            
             webSocketTextMessageHelper.send(session, WebsocketMessage.builder().messageType(FORBIDDEN).build());
             return;
         }
@@ -74,6 +107,50 @@ public class XMPPFacade {
         xmppClient.addIncomingMessageListener(connection.get(), session);
 
         webSocketTextMessageHelper.send(session, WebsocketMessage.builder().to(username).messageType(JOIN_SUCCESS).build());
+    }
+    
+    @GraphQLMutation
+    public void sendMessage(WebsocketMessage message) {
+        XMPPTCPConnection connection = CONNECTIONS2.get(message.getFrom());
+
+        if (connection == null) {
+            return;
+        }
+
+        switch (message.getMessageType()) {
+            case NEW_MESSAGE -> {
+                try {
+                    xmppClient.sendMessage(connection, message.getContent(), message.getTo());
+                    // TODO: save message for both users in DB
+                } catch (XMPPGenericException e) {
+                }
+            }
+            case ADD_CONTACT -> {
+                try {
+                    xmppClient.addContact(connection, message.getTo());
+                } catch (XMPPGenericException e) {
+                }
+            }
+            case GET_CONTACTS -> {
+                Set<RosterEntry> contacts = Set.of();
+                try {
+                    contacts = xmppClient.getContacts(connection);
+                } catch (XMPPGenericException e) {
+                }
+
+                JSONArray jsonArray = new JSONArray();
+                for (RosterEntry entry : contacts) {
+                    jsonArray.put(entry.getName());
+                }
+//                WebsocketMessage responseMessage = WebsocketMessage.builder()
+//                        .content(jsonArray.toString())
+//                        .messageType(GET_CONTACTS)
+//                        .build();
+//                log.info("Returning list of contacts {} for user {}.", jsonArray, connection.getUser());
+//                webSocketTextMessageHelper.send(session, responseMessage);
+            }
+            default -> log.warn("Message type not implemented.");
+        }
     }
 
     public void sendMessage(WebsocketMessage message, Session session) {

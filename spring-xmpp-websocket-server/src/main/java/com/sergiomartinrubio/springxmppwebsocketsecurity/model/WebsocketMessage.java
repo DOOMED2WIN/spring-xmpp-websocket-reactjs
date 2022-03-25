@@ -1,10 +1,14 @@
 package com.sergiomartinrubio.springxmppwebsocketsecurity.model;
 
+import lombok.AllArgsConstructor;
 import lombok.Builder;
-import lombok.Value;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 
-@Value
+@Data
 @Builder
+@AllArgsConstructor
+@NoArgsConstructor
 public class WebsocketMessage {
     String from;
     String to;
